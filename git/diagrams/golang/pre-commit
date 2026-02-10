@@ -1,0 +1,819 @@
+#!/usr/bin/env bash
+#
+# Pre-commit hook: Regenerate Go diagrams when Go files change
+#
+# Detects staged .go files and regenerates AST-based class diagrams and call
+# graphs. Optionally enforces strict review mode, requiring a review file
+# (e.g., architecture.md) to be staged when diagrams change structurally.
+#
+# Configuration: diagrams.conf in repo root (optional)
+#   See diagrams.sample.conf for available options.
+#
+# Strict review mode:
+#   git config docs.strictReview true
+#
+#   When enabled, commits that change diagram structure are rejected unless
+#   REVIEW_FILE is also staged. This ensures architecture docs stay in sync.
+#   Bypass with: git commit --no-verify
+
+set -o pipefail
+
+
+## setup #######################################################################
+################################################################################
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+# Defaults (can be overridden by config)
+DIAGRAMS_DIR="${REPO_ROOT}/docs/diagrams/generated"
+GENERATE_SCRIPT="${REPO_ROOT}/scripts/generate-diagrams.sh"
+REVIEW_FILE="${REPO_ROOT}/docs/architecture.md"
+
+# Load config
+if [[ -f "${REPO_ROOT}/diagrams.conf" ]]; then
+    # shellcheck source=/dev/null
+    source "${REPO_ROOT}/diagrams.conf"
+
+    # Resolve relative paths against repo root
+    [[ "${DIAGRAMS_DIR}" != /* ]] && DIAGRAMS_DIR="${REPO_ROOT}/${DIAGRAMS_DIR}"
+    [[ "${GENERATE_SCRIPT}" != /* ]] && GENERATE_SCRIPT="${REPO_ROOT}/${GENERATE_SCRIPT}"
+    [[ "${REVIEW_FILE}" != /* ]] && REVIEW_FILE="${REPO_ROOT}/${REVIEW_FILE}"
+fi
+
+TRACKING_FILE="${DIAGRAMS_DIR}/.tracking"
+
+# Colors (only if terminal)
+if [[ -t 1 ]]; then
+    C_INFO=$'\033[0;34m'
+    C_SUCCESS=$'\033[0;32m'
+    C_WARN=$'\033[0;33m'
+    C_ERROR=$'\033[0;31m'
+    C_BOLD=$'\033[1m'
+    C_DIM=$'\033[2m'
+    C_RESET=$'\033[0m'
+else
+    C_INFO="" C_SUCCESS="" C_WARN="" C_ERROR="" C_BOLD="" C_DIM="" C_RESET=""
+fi
+
+
+## helpful functions ###########################################################
+################################################################################
+
+function info() {
+    echo -e "${C_INFO}[docs]${C_RESET} ${1}"
+}
+
+function success() {
+    echo -e "${C_SUCCESS}[docs]${C_RESET} ${1}"
+}
+
+function warn() {
+    echo -e "${C_WARN}[docs]${C_RESET} ${1}"
+}
+
+function error() {
+    echo -e "${C_ERROR}[docs]${C_RESET} ${1}" >&2
+}
+
+
+## fingerprinting functions ####################################################
+################################################################################
+
+function _sha256() {
+    :  'Compute SHA256 hash of a file'
+    sha256sum "${1}" 2>/dev/null | cut -d' ' -f1
+}
+
+function _byte-freq-hash() {
+    :  'Compute byte frequency fingerprint of a file
+
+        Returns a hash of the byte frequency distribution.
+        Useful for files with non-deterministic ordering.
+    '
+    od -An -tu1 -w1 "${1}" 2>/dev/null | sort -n | uniq -c | sha256sum | cut -d' ' -f1
+}
+
+function _compute-fingerprints() {
+    :  'Compute fingerprints for current source files
+
+        Sets global variables:
+        - CURRENT_PUML_SHA256
+        - CURRENT_GV_FINGERPRINT
+    '
+    if [[ -f "${DIAGRAMS_DIR}/classes.puml" ]]; then
+        CURRENT_PUML_SHA256=$(_sha256 "${DIAGRAMS_DIR}/classes.puml")
+    else
+        CURRENT_PUML_SHA256=""
+    fi
+
+    if [[ -f "${DIAGRAMS_DIR}/callgraph.gv" ]]; then
+        CURRENT_GV_FINGERPRINT=$(_byte-freq-hash "${DIAGRAMS_DIR}/callgraph.gv")
+    else
+        CURRENT_GV_FINGERPRINT=""
+    fi
+}
+
+
+## tracking file functions #####################################################
+################################################################################
+
+function _read-tracking() {
+    :  'Read tracking file into global variables
+
+        Sets:
+        - TRACKED_PUML_SHA256
+        - TRACKED_GV_FINGERPRINT
+        - TRACKED_VERIFIED_AT
+    '
+    TRACKED_PUML_SHA256=""
+    TRACKED_GV_FINGERPRINT=""
+    TRACKED_VERIFIED_AT=""
+
+    if [[ -f "${TRACKING_FILE}" ]]; then
+        # shellcheck source=/dev/null
+        source "${TRACKING_FILE}"
+        TRACKED_PUML_SHA256="${CLASSES_PUML_SHA256:-}"
+        TRACKED_GV_FINGERPRINT="${CALLGRAPH_GV_FINGERPRINT:-}"
+        TRACKED_VERIFIED_AT="${VERIFIED_AT:-}"
+    fi
+}
+
+function _write-tracking() {
+    :  'Write current fingerprints to tracking file'
+    cat > "${TRACKING_FILE}" << EOF
+# Auto-generated tracking file for documentation diagrams
+# Maps source fingerprints to verified architecture state
+CLASSES_PUML_SHA256="${CURRENT_PUML_SHA256}"
+CALLGRAPH_GV_FINGERPRINT="${CURRENT_GV_FINGERPRINT}"
+VERIFIED_AT="$(date -Iseconds)"
+EOF
+}
+
+function _sources-match-tracking() {
+    :  'Check if current sources match tracked fingerprints
+
+        @return
+            0 if match (architecture is up-to-date), 1 if mismatch
+    '
+    _read-tracking
+    _compute-fingerprints
+
+    [[ "${CURRENT_PUML_SHA256}" == "${TRACKED_PUML_SHA256}" ]] && \
+    [[ "${CURRENT_GV_FINGERPRINT}" == "${TRACKED_GV_FINGERPRINT}" ]]
+}
+
+
+## diff and context extraction #################################################
+################################################################################
+
+function _extract-changed-classes() {
+    :  'Extract class names that changed from a unified diff
+
+        Reads diff from stdin, outputs class names (one per line).
+        Tracks context to detect method/field changes within class blocks.
+    '
+    local -- __line __current_class=""
+    local -a __classes=()
+
+    while IFS= read -r __line; do
+        # Track which class block we're in
+        if [[ "${__line}" =~ class[[:space:]]+\"([^\"]+)\" ]]; then
+            __current_class="${BASH_REMATCH[1]}"
+        fi
+
+        # Detect end of class block
+        if [[ "${__line}" =~ ^[[:space:]]{4}\}[[:space:]]*$ ]]; then
+            __current_class=""
+        fi
+
+        # New class added/removed
+        if [[ "${__line}" =~ ^[+-][[:space:]]*class[[:space:]]+\"([^\"]+)\" ]]; then
+            __classes+=("${BASH_REMATCH[1]}")
+        fi
+
+        # Method or field added/removed within a class context
+        if [[ -n "${__current_class}" ]]; then
+            if [[ "${__line}" =~ ^[+-][[:space:]]+[\+\-][[:space:]]+[A-Za-z_] ]]; then
+                __classes+=("${__current_class}")
+            fi
+        fi
+    done
+
+    printf '%s\n' "${__classes[@]}" | sort -u
+}
+
+function _extract-connected-context() {
+    :  'Extract class definitions and relationships for given class names
+
+        @arg puml_file
+            Path to the PlantUML file
+        @arg class_names
+            Newline-separated list of class names (stdin or arg)
+    '
+    local -- __puml_file="${1}"
+    local -- __class_name
+    local -a __patterns=()
+
+    if [[ -t 0 ]]; then
+        shift
+        for __class_name in "${@}"; do
+            __patterns+=("${__class_name}")
+        done
+    else
+        while IFS= read -r __class_name; do
+            [[ -n "${__class_name}" ]] && __patterns+=("${__class_name}")
+        done
+    fi
+
+    if [[ ${#__patterns[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    local -- __grep_pattern
+    __grep_pattern=$(printf '%s\|' "${__patterns[@]}")
+    __grep_pattern="${__grep_pattern%\\|}"
+
+    grep -E "(class \"[^\"]*($__grep_pattern)[^\"]*\"|\"[^\"]*($__grep_pattern)[^\"]*\"[[:space:]]*(#\.\.|<\|--|\*--|-->|\.\.>))" "${__puml_file}" 2>/dev/null || true
+}
+
+function _find-gopls() {
+    :  'Find gopls binary, checking common locations'
+    local -- __gopls
+
+    __gopls=$(command -v gopls 2>/dev/null)
+    if [[ -n "${__gopls}" ]]; then
+        echo "${__gopls}"
+        return 0
+    fi
+
+    local -- __gopath
+    __gopath=$(go env GOPATH 2>/dev/null)
+    if [[ -n "${__gopath}" ]] && [[ -x "${__gopath}/bin/gopls" ]]; then
+        echo "${__gopath}/bin/gopls"
+        return 0
+    fi
+
+    if [[ -x "${HOME}/go/bin/gopls" ]]; then
+        echo "${HOME}/go/bin/gopls"
+        return 0
+    fi
+
+    return 1
+}
+
+function _find-symbol-location() {
+    :  'Find the file:line location of a Go type/struct by name
+
+        @arg symbol_name
+            The name of the type to find
+    '
+    local -- __symbol="${1}"
+    local -- __match
+
+    __match=$(grep -rn "^type ${__symbol} struct" --include="*.go" "${REPO_ROOT}" 2>/dev/null | head -1)
+
+    if [[ -n "${__match}" ]]; then
+        local -- __file __line
+        __file=$(echo "${__match}" | cut -d: -f1)
+        __line=$(echo "${__match}" | cut -d: -f2)
+        local -- __col
+        __col=$(echo "${__match}" | cut -d: -f3- | grep -bo "${__symbol}" | head -1 | cut -d: -f1)
+        __col=$(( __col + 1 ))
+        echo "${__file}:${__line}:${__col}"
+        return 0
+    fi
+
+    return 1
+}
+
+function _get-gopls-references() {
+    :  'Get references to a symbol using gopls
+
+        @arg gopls_path
+            Path to gopls binary
+        @arg symbol_name
+            Name of the symbol to find references for
+    '
+    local -- __gopls="${1}"
+    local -- __symbol="${2}"
+    local -- __location
+
+    __location=$(_find-symbol-location "${__symbol}")
+    if [[ -z "${__location}" ]]; then
+        return 1
+    fi
+
+    "${__gopls}" references "${__location}" 2>/dev/null | \
+        cut -d: -f1-2 | \
+        sort -u
+}
+
+function _extract-connected-classes-gopls() {
+    :  'Extract connected class names with rich context using gopls references
+
+        @arg class_names
+            Newline-separated list of class names (stdin)
+
+        Outputs structured connection data:
+        FORMAT: CONNECTED_TYPE|SOURCE_CLASS|RELATIONSHIP|FILE:LINE|METHOD_NAME
+
+        Falls back to empty output if gopls unavailable (return code 1).
+    '
+    local -- __gopls __class_name __ref_file __ref_line
+    local -a __connections=()
+    local -a __changed_list=()
+
+    __gopls=$(_find-gopls)
+
+    if [[ -z "${__gopls}" ]]; then
+        return 1
+    fi
+
+    while IFS= read -r __class_name; do
+        [[ -z "${__class_name}" ]] && continue
+        __changed_list+=("${__class_name}")
+    done
+
+    for __class_name in "${__changed_list[@]}"; do
+        # Find types that REFERENCE this class
+        while IFS= read -r __ref; do
+            [[ -z "${__ref}" ]] && continue
+
+            __ref_file=$(echo "${__ref}" | cut -d: -f1)
+            __ref_line=$(echo "${__ref}" | cut -d: -f2)
+
+            local -- __context __enc_type __enc_method __ctx_type
+            __context=$(_find-enclosing-context "${__ref_file}" "${__ref_line}")
+            __enc_type=$(echo "${__context}" | cut -d'|' -f1)
+            __enc_method=$(echo "${__context}" | cut -d'|' -f2)
+            __ctx_type=$(echo "${__context}" | cut -d'|' -f3)
+
+            [[ "${__enc_type}" == "${__class_name}" ]] && continue
+            [[ -z "${__enc_type}" ]] && continue
+
+            local -- __category
+            __category=$(_categorize-reference "${__ref_file}" "${__ref_line}" "${__class_name}")
+
+            local -- __rel_file
+            __rel_file="${__ref_file#${REPO_ROOT}/}"
+
+            local -- __connected_name="${__enc_type}"
+            __connections+=("${__connected_name}|${__class_name}|${__category}|${__rel_file}:${__ref_line}|${__enc_method}")
+
+        done < <(_get-gopls-references "${__gopls}" "${__class_name}")
+
+        # Find types that this class REFERENCES (field types)
+        local -- __location __type_refs
+        __location=$(_find-symbol-location "${__class_name}")
+        if [[ -n "${__location}" ]]; then
+            local -- __src_file="${__location%%:*}"
+            local -- __src_line="${__location#*:}"
+            __src_line="${__src_line%%:*}"
+            local -- __rel_src="${__src_file#${REPO_ROOT}/}"
+
+            __type_refs=$(_extract-type-references "${__src_file}" "${__class_name}")
+            while IFS= read -r __type_ref; do
+                [[ -z "${__type_ref}" ]] && continue
+
+                local -- __is_changed=false
+                for __c in "${__changed_list[@]}"; do
+                    if [[ "${__type_ref}" == "${__c}" ]]; then
+                        __is_changed=true
+                        break
+                    fi
+                done
+
+                if ! ${__is_changed}; then
+                    __connections+=("${__type_ref}|${__class_name}|field|${__rel_src}:${__src_line}|")
+                fi
+            done <<< "${__type_refs}"
+        fi
+    done
+
+    printf '%s\n' "${__connections[@]}" 2>/dev/null | sort -u
+}
+
+function _extract-type-references() {
+    :  'Extract type references from a struct definition
+
+        @arg file_path
+            Path to the Go file
+        @arg struct_name
+            Name of the struct to analyze
+    '
+    local -- __file="${1}"
+    local -- __struct="${2}"
+    local -a __types=()
+
+    local -- __in_struct=false __line
+    while IFS= read -r __line; do
+        if [[ "${__line}" =~ ^type[[:space:]]+${__struct}[[:space:]]+struct ]]; then
+            __in_struct=true
+            continue
+        fi
+        if ${__in_struct}; then
+            if [[ "${__line}" =~ ^\} ]]; then
+                break
+            fi
+            [[ "${__line}" =~ ^[[:space:]]*$ ]] && continue
+            [[ "${__line}" =~ ^[[:space:]]*/\* ]] && continue
+            [[ "${__line}" =~ ^[[:space:]]*// ]] && continue
+
+            local -- __field_type
+
+            # Match qualified types: *pkg.Type or pkg.Type
+            __field_type=$(echo "${__line}" | grep -oP '\*?[a-z][a-z0-9_]*\.[A-Z][A-Za-z0-9_]*' | head -1)
+            if [[ -n "${__field_type}" ]]; then
+                __field_type="${__field_type#\*}"
+                __types+=("${__field_type}")
+                continue
+            fi
+
+            # Match unqualified pointer types: *TypeName
+            if [[ "${__line}" =~ [[:space:]][a-z][a-zA-Z0-9_]*[[:space:]]+\*([A-Z][A-Za-z0-9_]*) ]]; then
+                __types+=("${BASH_REMATCH[1]}")
+                continue
+            fi
+
+            # Match unqualified types (capitalized, not built-in)
+            if [[ "${__line}" =~ [[:space:]][a-z][a-zA-Z0-9_]*[[:space:]]+([A-Z][A-Za-z0-9_]*)[[:space:]]*$ ]]; then
+                local -- __potential="${BASH_REMATCH[1]}"
+                case "${__potential}" in
+                    String|Int|Bool|Float|Byte|Rune|Error) ;;
+                    *) __types+=("${__potential}") ;;
+                esac
+            fi
+        fi
+    done < "${__file}"
+
+    printf '%s\n' "${__types[@]}" 2>/dev/null | sort -u
+}
+
+function _find-enclosing-context() {
+    :  'Find the enclosing type and method for a given line in a Go file
+
+        @arg file_path
+            Path to the Go file
+        @arg line_number
+            Line number to check
+
+        Outputs: TYPE|METHOD|CONTEXT_TYPE
+    '
+    local -- __file="${1}"
+    local -- __line="${2}"
+    local -- __content
+
+    __content=$(head -n "${__line}" "${__file}" 2>/dev/null | tac)
+
+    # Check for method receiver
+    local -- __method_line
+    __method_line=$(echo "${__content}" | grep -m1 -P '^\s*func\s+\([^)]+\)\s+[A-Za-z_]')
+    if [[ -n "${__method_line}" ]]; then
+        local -- __type_name __method_name
+        __type_name=$(echo "${__method_line}" | grep -oP '\(\s*\w+\s+\*?([A-Z][A-Za-z0-9_]*)' | grep -oP '[A-Z][A-Za-z0-9_]*$')
+        __method_name=$(echo "${__method_line}" | grep -oP '\)\s+([A-Za-z_][A-Za-z0-9_]*)' | grep -oP '[A-Za-z_][A-Za-z0-9_]*$')
+        echo "${__type_name}|${__method_name}|method"
+        return 0
+    fi
+
+    # Check for struct definition
+    local -- __struct_line
+    __struct_line=$(echo "${__content}" | grep -m1 -P '^type\s+[A-Z][A-Za-z0-9_]*\s+struct')
+    if [[ -n "${__struct_line}" ]]; then
+        local -- __type_name
+        __type_name=$(echo "${__struct_line}" | awk '{print $2}')
+        echo "${__type_name}||struct_field"
+        return 0
+    fi
+
+    # Check for standalone function
+    local -- __func_line
+    __func_line=$(echo "${__content}" | grep -m1 -P '^\s*func\s+[A-Z][A-Za-z0-9_]*\s*\(')
+    if [[ -n "${__func_line}" ]]; then
+        local -- __method_name
+        __method_name=$(echo "${__func_line}" | grep -oP 'func\s+([A-Z][A-Za-z0-9_]*)' | awk '{print $2}')
+        echo "|${__method_name}|function"
+        return 0
+    fi
+
+    echo "||unknown"
+    return 1
+}
+
+function _categorize-reference() {
+    :  'Categorize how a type is referenced on a given line
+
+        @arg file_path
+            Path to the Go file
+        @arg line_number
+            Line number to check
+        @arg type_name
+            The type being referenced
+
+        Outputs: creates, param, returns, field, or uses
+    '
+    local -- __file="${1}"
+    local -- __line_num="${2}"
+    local -- __type_name="${3}"
+    local -- __line_content
+
+    __line_content=$(sed -n "${__line_num}p" "${__file}" 2>/dev/null)
+
+    # Check for instantiation
+    if [[ "${__line_content}" =~ \&?${__type_name}\{ ]]; then
+        echo "creates"
+        return 0
+    fi
+
+    # Check for return type
+    if [[ "${__line_content}" =~ \)[[:space:]]*\*?${__type_name}[[:space:]]*\{ ]] || \
+       [[ "${__line_content}" =~ \)[[:space:]]*\(.*\*?${__type_name} ]] || \
+       [[ "${__line_content}" =~ return.*${__type_name} ]]; then
+        echo "returns"
+        return 0
+    fi
+
+    # Check for parameter
+    if [[ "${__line_content}" =~ func.*\(.*\*?${__type_name} ]]; then
+        echo "param"
+        return 0
+    fi
+
+    # Check for field definition
+    if [[ "${__line_content}" =~ ^[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]+\*?${__type_name} ]] || \
+       [[ "${__line_content}" =~ ^[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]+\*?[a-z]+\.${__type_name} ]]; then
+        echo "field"
+        return 0
+    fi
+
+    echo "uses"
+    return 0
+}
+
+function _format-rich-connections() {
+    :  'Format rich connection data for display'
+    local -- __connections="${1}"
+    local -- __current_class="" __line
+    declare -A __seen_connections
+
+    local -- __primitives="string|int|bool|error|byte|rune|float32|float64|uint|int32|int64|uint32|uint64|uintptr|method|struct_field|function|unknown"
+
+    while IFS='|' read -r __connected __source __rel __location __method; do
+        [[ -z "${__connected}" ]] && continue
+        [[ -z "${__rel}" ]] && continue
+
+        if [[ "${__connected}" =~ ^(${__primitives})$ ]]; then
+            continue
+        fi
+
+        [[ "${__connected}" == "${__source}" ]] && continue
+
+        if [[ "${__connected}" =~ ^[a-z] ]] && [[ ! "${__connected}" =~ \. ]]; then
+            continue
+        fi
+
+        local -- __key="${__connected}|${__source}|${__rel}|${__method}"
+        if [[ -n "${__seen_connections[${__key}]+x}" ]]; then
+            continue
+        fi
+        __seen_connections["${__key}"]=1
+
+        if [[ "${__connected}" != "${__current_class}" ]]; then
+            [[ -n "${__current_class}" ]] && echo ""
+            echo "  ${C_BOLD}${__connected}${C_RESET}"
+            __current_class="${__connected}"
+        fi
+
+        local -- __rel_text
+        case "${__rel}" in
+            creates)  __rel_text="creates" ;;
+            param)    __rel_text="takes param" ;;
+            returns)  __rel_text="returns" ;;
+            field)    __rel_text="used as field type in" ;;
+            uses)     __rel_text="uses" ;;
+            *)        __rel_text="${__rel}" ;;
+        esac
+
+        local -- __method_text=""
+        if [[ -n "${__method}" ]]; then
+            __method_text=" in ${__method}()"
+        fi
+
+        local -- __loc_display=""
+        if [[ -n "${__location}" ]]; then
+            __loc_display="${C_DIM}(${__location})${C_RESET}"
+        fi
+
+        echo "    -> ${__rel_text} ${__source}${__method_text} ${__loc_display}"
+
+    done <<< "${__connections}"
+}
+
+function _generate-review-context() {
+    :  'Generate context for architecture review
+
+        @arg old_file
+            Path to old .puml file
+        @arg new_file
+            Path to new .puml file
+    '
+    local -- __old_file="${1}"
+    local -- __new_file="${2}"
+    local -- __diff
+    local -- __changed_classes
+    local -- __connected_context
+
+    __diff=$(diff -u "${__old_file}" "${__new_file}" 2>/dev/null || true)
+
+    if [[ -z "${__diff}" ]]; then
+        echo "No structural changes detected in class diagram."
+        return 0
+    fi
+
+    __changed_classes=$(echo "${__diff}" | _extract-changed-classes)
+
+    local -- __connected_classes="" __connection_method=""
+    if [[ -n "${__changed_classes}" ]]; then
+        __connected_classes=$(echo "${__changed_classes}" | _extract-connected-classes-gopls 2>/dev/null)
+        if [[ -n "${__connected_classes}" ]]; then
+            __connection_method="gopls"
+        else
+            __connected_context=$(echo "${__changed_classes}" | _extract-connected-context "${__new_file}")
+            __connection_method="grep"
+        fi
+    fi
+
+    local -- __review_file_rel="${REVIEW_FILE#${REPO_ROOT}/}"
+
+    echo ""
+    echo "${C_BOLD}=======================================================================${C_RESET}"
+    echo "${C_BOLD}                    ARCHITECTURE REVIEW REQUIRED${C_RESET}"
+    echo "${C_BOLD}=======================================================================${C_RESET}"
+    echo ""
+    echo "${C_INFO}The following structural changes were detected:${C_RESET}"
+    echo ""
+    echo "${C_DIM}--- classes.puml (before)${C_RESET}"
+    echo "${C_DIM}+++ classes.puml (after)${C_RESET}"
+    echo "${__diff}" | head -100
+    echo ""
+
+    if [[ -n "${__changed_classes}" ]]; then
+        echo "${C_INFO}Changed classes:${C_RESET}"
+        echo "${__changed_classes}" | sed 's/^/  - /'
+        echo ""
+    fi
+
+    if [[ -n "${__connected_classes}" ]] && [[ "${__connection_method}" == "gopls" ]]; then
+        echo "${C_INFO}Connected classes (via ${__connection_method}):${C_RESET}"
+        _format-rich-connections "${__connected_classes}"
+        echo ""
+    elif [[ -n "${__connected_context}" ]]; then
+        echo "${C_INFO}Connected relationships (via grep, may be incomplete):${C_RESET}"
+        echo "${__connected_context}" | sed 's/^/  /'
+        echo ""
+    fi
+
+    echo "${C_BOLD}Please review:${C_RESET}"
+    echo "  1. Will these changes negatively impact connected logic?"
+    echo "  2. Do they fit the overall architecture?"
+    echo "  3. Update ${C_INFO}${__review_file_rel}${C_RESET} to reflect these changes"
+    echo ""
+    echo "${C_WARN}Stage ${__review_file_rel} and retry the commit.${C_RESET}"
+    echo ""
+    echo "${C_BOLD}=======================================================================${C_RESET}"
+    echo ""
+}
+
+
+## main logic ##################################################################
+################################################################################
+
+function _is-strict-mode() {
+    :  'Check if strict review mode is enabled'
+    local -- __value
+    __value=$(git config --get docs.strictReview 2>/dev/null || echo "false")
+    [[ "${__value}" == "true" ]]
+}
+
+function _is-review-file-staged() {
+    :  'Check if the review file is staged for commit'
+    local -- __review_rel="${REVIEW_FILE#${REPO_ROOT}/}"
+    git diff --cached --name-only | grep -q "^${__review_rel}$"
+}
+
+function _byte-freq-match() {
+    :  'Compare two files by byte frequency (for non-deterministic files)'
+    local -- __f1="${1}" __f2="${2}"
+    local -- __h1 __h2
+    __h1=$(od -An -tu1 -w1 "${__f1}" | sort -n | uniq -c)
+    __h2=$(od -An -tu1 -w1 "${__f2}" | sort -n | uniq -c)
+    [[ "${__h1}" == "${__h2}" ]]
+}
+
+function _handle-strict-review() {
+    :  'Handle strict review mode checks
+
+        @return
+            0 if review passed, 1 if commit should be rejected
+    '
+    if [[ ! -f "${TRACKING_FILE}" ]]; then
+        if [[ -f "${DIAGRAMS_DIR}/classes.puml" ]]; then
+            _compute-fingerprints
+            _write-tracking
+            info "Initialized tracking file (first run)"
+            return 0
+        fi
+    fi
+
+    if _sources-match-tracking; then
+        success "Diagram sources match verified state"
+        return 0
+    fi
+
+    if _is-review-file-staged; then
+        local -- __review_rel="${REVIEW_FILE#${REPO_ROOT}/}"
+        info "Architecture changes detected and ${__review_rel} is staged"
+        _compute-fingerprints
+        _write-tracking
+        success "Tracking file updated"
+        return 0
+    fi
+
+    local -- __old_puml
+    __old_puml=$(mktemp)
+    local -- __diagrams_rel="${DIAGRAMS_DIR#${REPO_ROOT}/}"
+    if git show "HEAD:${__diagrams_rel}/classes.puml" > "${__old_puml}" 2>/dev/null; then
+        _generate-review-context "${__old_puml}" "${DIAGRAMS_DIR}/classes.puml"
+    else
+        echo ""
+        warn "New class diagram detected. Please review and update architecture docs."
+        echo ""
+    fi
+    rm -f "${__old_puml}"
+
+    local -- __review_rel="${REVIEW_FILE#${REPO_ROOT}/}"
+    error "Commit rejected: ${__review_rel} must be staged when diagrams change"
+    echo ""
+    echo "To bypass strict review mode for this commit:"
+    echo "  git commit --no-verify"
+    echo ""
+    echo "To disable strict review mode:"
+    echo "  git config docs.strictReview false"
+    echo ""
+
+    return 1
+}
+
+
+## main ########################################################################
+################################################################################
+
+function main() {
+    local -- __staged_go_files
+    local -- __strict_mode
+
+    # Check if any .go files are staged
+    __staged_go_files=$(git diff --cached --name-only --diff-filter=ACMR | grep '\.go$' || true)
+
+    if [[ -z "${__staged_go_files}" ]]; then
+        return 0
+    fi
+
+    __strict_mode=$(_is-strict-mode && echo "true" || echo "false")
+
+    info "Go files changed, regenerating diagrams..."
+
+    if [[ ! -x "${GENERATE_SCRIPT}" ]]; then
+        error "Generate script not found: ${GENERATE_SCRIPT}"
+        error "Set GENERATE_SCRIPT in diagrams.conf or copy generate-diagrams.sh to scripts/"
+        return 0
+    fi
+
+    if ! "${GENERATE_SCRIPT}"; then
+        warn "Failed to regenerate diagrams (continuing anyway)"
+        return 0
+    fi
+
+    # Handle strict review mode
+    if [[ "${__strict_mode}" == "true" ]]; then
+        if ! _handle-strict-review; then
+            rm -f "${DIAGRAMS_DIR}"/*.new 2>/dev/null || true
+            return 1
+        fi
+    fi
+
+    # Stage the regenerated diagrams
+    if [[ -d "${DIAGRAMS_DIR}" ]]; then
+        git add "${DIAGRAMS_DIR}"/*.svg "${DIAGRAMS_DIR}"/*.puml "${DIAGRAMS_DIR}"/*.gv 2>/dev/null || true
+        [[ -f "${TRACKING_FILE}" ]] && git add "${TRACKING_FILE}" 2>/dev/null || true
+        success "Diagrams staged"
+    fi
+
+    return 0
+}
+
+
+## run #########################################################################
+################################################################################
+
+main "${@}"
