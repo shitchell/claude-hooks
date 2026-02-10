@@ -1,0 +1,270 @@
+#!/usr/bin/env bash
+#
+# Pre-commit hook: Regenerate Python diagrams when .py files change
+#
+# Detects staged .py files and regenerates pyreverse-based class and package
+# diagrams. Optionally enforces strict review mode, requiring a review file
+# (e.g., architecture.md) to be staged when diagrams change structurally.
+#
+# Configuration: diagrams.conf in repo root (optional)
+#   See diagrams.sample.conf for available options.
+#
+# Strict review mode:
+#   git config docs.strictReview true
+#
+# EXPERIMENTAL: This hook has not been tested against real projects.
+# Please report issues and suggest improvements.
+
+set -o pipefail
+
+
+## setup #######################################################################
+################################################################################
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+# Defaults (can be overridden by config)
+DIAGRAMS_DIR="${REPO_ROOT}/docs/diagrams/generated"
+GENERATE_SCRIPT="${REPO_ROOT}/scripts/generate-diagrams.sh"
+REVIEW_FILE="${REPO_ROOT}/docs/architecture.md"
+
+# Load config
+if [[ -f "${REPO_ROOT}/diagrams.conf" ]]; then
+    # shellcheck source=/dev/null
+    source "${REPO_ROOT}/diagrams.conf"
+
+    # Resolve relative paths against repo root
+    [[ "${DIAGRAMS_DIR}" != /* ]] && DIAGRAMS_DIR="${REPO_ROOT}/${DIAGRAMS_DIR}"
+    [[ "${GENERATE_SCRIPT}" != /* ]] && GENERATE_SCRIPT="${REPO_ROOT}/${GENERATE_SCRIPT}"
+    [[ "${REVIEW_FILE}" != /* ]] && REVIEW_FILE="${REPO_ROOT}/${REVIEW_FILE}"
+fi
+
+TRACKING_FILE="${DIAGRAMS_DIR}/.tracking"
+
+# Colors (only if terminal)
+if [[ -t 1 ]]; then
+    C_INFO=$'\033[0;34m'
+    C_SUCCESS=$'\033[0;32m'
+    C_WARN=$'\033[0;33m'
+    C_ERROR=$'\033[0;31m'
+    C_BOLD=$'\033[1m'
+    C_DIM=$'\033[2m'
+    C_RESET=$'\033[0m'
+else
+    C_INFO="" C_SUCCESS="" C_WARN="" C_ERROR="" C_BOLD="" C_DIM="" C_RESET=""
+fi
+
+
+## helpful functions ###########################################################
+################################################################################
+
+function info() {
+    echo -e "${C_INFO}[docs]${C_RESET} ${1}"
+}
+
+function success() {
+    echo -e "${C_SUCCESS}[docs]${C_RESET} ${1}"
+}
+
+function warn() {
+    echo -e "${C_WARN}[docs]${C_RESET} ${1}"
+}
+
+function error() {
+    echo -e "${C_ERROR}[docs]${C_RESET} ${1}" >&2
+}
+
+
+## fingerprinting ##############################################################
+################################################################################
+
+function _sha256() {
+    :  'Compute SHA256 hash of a file'
+    sha256sum "${1}" 2>/dev/null | cut -d' ' -f1
+}
+
+function _compute-fingerprints() {
+    :  'Compute fingerprints for current source files
+
+        Sets global variables:
+        - CURRENT_CLASSES_SHA256
+        - CURRENT_PACKAGES_SHA256
+    '
+    if [[ -f "${DIAGRAMS_DIR}/classes.dot" ]]; then
+        CURRENT_CLASSES_SHA256=$(_sha256 "${DIAGRAMS_DIR}/classes.dot")
+    else
+        CURRENT_CLASSES_SHA256=""
+    fi
+
+    if [[ -f "${DIAGRAMS_DIR}/packages.dot" ]]; then
+        CURRENT_PACKAGES_SHA256=$(_sha256 "${DIAGRAMS_DIR}/packages.dot")
+    else
+        CURRENT_PACKAGES_SHA256=""
+    fi
+}
+
+function _read-tracking() {
+    :  'Read tracking file into global variables'
+    TRACKED_CLASSES_SHA256=""
+    TRACKED_PACKAGES_SHA256=""
+    TRACKED_VERIFIED_AT=""
+
+    if [[ -f "${TRACKING_FILE}" ]]; then
+        # shellcheck source=/dev/null
+        source "${TRACKING_FILE}"
+    fi
+}
+
+function _write-tracking() {
+    :  'Write current fingerprints to tracking file'
+    cat > "${TRACKING_FILE}" << EOF
+# Auto-generated tracking file for documentation diagrams
+TRACKED_CLASSES_SHA256="${CURRENT_CLASSES_SHA256}"
+TRACKED_PACKAGES_SHA256="${CURRENT_PACKAGES_SHA256}"
+TRACKED_VERIFIED_AT="$(date -Iseconds)"
+EOF
+}
+
+function _sources-match-tracking() {
+    :  'Check if current sources match tracked fingerprints
+
+        @return
+            0 if match, 1 if mismatch
+    '
+    _read-tracking
+    _compute-fingerprints
+
+    [[ "${CURRENT_CLASSES_SHA256}" == "${TRACKED_CLASSES_SHA256}" ]] && \
+    [[ "${CURRENT_PACKAGES_SHA256}" == "${TRACKED_PACKAGES_SHA256}" ]]
+}
+
+
+## strict review ###############################################################
+################################################################################
+
+function _is-strict-mode() {
+    :  'Check if strict review mode is enabled'
+    local -- __value
+    __value=$(git config --get docs.strictReview 2>/dev/null || echo "false")
+    [[ "${__value}" == "true" ]]
+}
+
+function _is-review-file-staged() {
+    :  'Check if the review file is staged for commit'
+    local -- __review_rel="${REVIEW_FILE#${REPO_ROOT}/}"
+    git diff --cached --name-only | grep -q "^${__review_rel}$"
+}
+
+function _handle-strict-review() {
+    :  'Handle strict review mode checks
+
+        @return
+            0 if review passed, 1 if commit should be rejected
+    '
+    if [[ ! -f "${TRACKING_FILE}" ]]; then
+        if [[ -f "${DIAGRAMS_DIR}/classes.dot" ]]; then
+            _compute-fingerprints
+            _write-tracking
+            info "Initialized tracking file (first run)"
+            return 0
+        fi
+    fi
+
+    if _sources-match-tracking; then
+        success "Diagram sources match verified state"
+        return 0
+    fi
+
+    if _is-review-file-staged; then
+        local -- __review_rel="${REVIEW_FILE#${REPO_ROOT}/}"
+        info "Architecture changes detected and ${__review_rel} is staged"
+        _compute-fingerprints
+        _write-tracking
+        success "Tracking file updated"
+        return 0
+    fi
+
+    local -- __review_rel="${REVIEW_FILE#${REPO_ROOT}/}"
+
+    echo ""
+    echo "${C_BOLD}=======================================================================${C_RESET}"
+    echo "${C_BOLD}                    ARCHITECTURE REVIEW REQUIRED${C_RESET}"
+    echo "${C_BOLD}=======================================================================${C_RESET}"
+    echo ""
+    echo "${C_INFO}Class or package diagrams have changed.${C_RESET}"
+    echo ""
+    echo "${C_BOLD}Please review:${C_RESET}"
+    echo "  1. Will these changes negatively impact connected logic?"
+    echo "  2. Do they fit the overall architecture?"
+    echo "  3. Update ${C_INFO}${__review_rel}${C_RESET} to reflect these changes"
+    echo ""
+    echo "${C_WARN}Stage ${__review_rel} and retry the commit.${C_RESET}"
+    echo ""
+    echo "${C_BOLD}=======================================================================${C_RESET}"
+    echo ""
+
+    error "Commit rejected: ${__review_rel} must be staged when diagrams change"
+    echo ""
+    echo "To bypass strict review mode for this commit:"
+    echo "  git commit --no-verify"
+    echo ""
+    echo "To disable strict review mode:"
+    echo "  git config docs.strictReview false"
+    echo ""
+
+    return 1
+}
+
+
+## main ########################################################################
+################################################################################
+
+function main() {
+    local -- __staged_py_files
+    local -- __strict_mode
+
+    # Check if any .py files are staged
+    __staged_py_files=$(git diff --cached --name-only --diff-filter=ACMR | grep '\.py$' || true)
+
+    if [[ -z "${__staged_py_files}" ]]; then
+        return 0
+    fi
+
+    __strict_mode=$(_is-strict-mode && echo "true" || echo "false")
+
+    info "Python files changed, regenerating diagrams..."
+
+    if [[ ! -x "${GENERATE_SCRIPT}" ]]; then
+        error "Generate script not found: ${GENERATE_SCRIPT}"
+        error "Set GENERATE_SCRIPT in diagrams.conf or copy generate-diagrams.sh to scripts/"
+        return 0
+    fi
+
+    if ! "${GENERATE_SCRIPT}"; then
+        warn "Failed to regenerate diagrams (continuing anyway)"
+        return 0
+    fi
+
+    # Handle strict review mode
+    if [[ "${__strict_mode}" == "true" ]]; then
+        if ! _handle-strict-review; then
+            rm -f "${DIAGRAMS_DIR}"/*.new 2>/dev/null || true
+            return 1
+        fi
+    fi
+
+    # Stage the regenerated diagrams
+    if [[ -d "${DIAGRAMS_DIR}" ]]; then
+        git add "${DIAGRAMS_DIR}"/*.svg "${DIAGRAMS_DIR}"/*.dot 2>/dev/null || true
+        [[ -f "${TRACKING_FILE}" ]] && git add "${TRACKING_FILE}" 2>/dev/null || true
+        success "Diagrams staged"
+    fi
+
+    return 0
+}
+
+
+## run #########################################################################
+################################################################################
+
+main "${@}"
