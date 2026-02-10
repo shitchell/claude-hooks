@@ -1,0 +1,20 @@
+{
+    "_comment": "diagrams.json -- Configuration for JavaScript diagram generation hooks",
+    "_comment2": "Place this file as diagrams.json in your repository root.",
+
+    "scanDirs": ["src"],
+
+    "diagramsDir": "docs/diagrams",
+
+    "reviewFile": "docs/ARCHITECTURE.md",
+
+    "validateScript": "tools/validate-architecture.mjs",
+
+    "triggerPattern": "\\.js$",
+
+    "entryPatterns": ["main\\.js$", "index\\.js$"],
+
+    "extensions": [".js"],
+
+    "baseDir": ""
+}

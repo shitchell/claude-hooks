@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+#
+# Pre-commit hook: Validate architecture diagrams when JS files change
+#
+# Detects staged JS files and runs the architecture validation script, which
+# regenerates Mermaid diagrams and blocks the commit if the review file
+# (e.g., ARCHITECTURE.md) isn't staged alongside structural changes.
+#
+# Configuration: diagrams.json in repo root (optional)
+#   See diagrams.sample.json for available options.
+#
+# Enable this hook:
+#   git config core.hooksPath .githooks
+#
+# Bypass this hook:
+#   git commit --no-verify
+
+set -o pipefail
+
+# ---------------------------------------------------------------------------
+# Setup
+# ---------------------------------------------------------------------------
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+# Defaults
+TRIGGER_PATTERN='\.js$'
+VALIDATE_SCRIPT="${REPO_ROOT}/tools/validate-architecture.mjs"
+DIAGRAMS_DIR="${REPO_ROOT}/docs/diagrams"
+
+# Load config overrides from diagrams.json via node
+if [[ -f "${REPO_ROOT}/diagrams.json" ]] && command -v node &>/dev/null; then
+    _config=$(node -e "
+        const c = JSON.parse(require('fs').readFileSync('${REPO_ROOT}/diagrams.json', 'utf-8'));
+        if (c.triggerPattern) console.log('TRIGGER_PATTERN=' + c.triggerPattern);
+        if (c.validateScript) console.log('VALIDATE_SCRIPT=${REPO_ROOT}/' + c.validateScript);
+        if (c.diagramsDir) console.log('DIAGRAMS_DIR=${REPO_ROOT}/' + c.diagramsDir);
+    " 2>/dev/null)
+
+    while IFS='=' read -r key val; do
+        [[ -z "${key}" ]] && continue
+        case "${key}" in
+            TRIGGER_PATTERN) TRIGGER_PATTERN="${val}" ;;
+            VALIDATE_SCRIPT) VALIDATE_SCRIPT="${val}" ;;
+            DIAGRAMS_DIR) DIAGRAMS_DIR="${val}" ;;
+        esac
+    done <<< "${_config}"
+fi
+
+# Colors (only if terminal)
+if [[ -t 1 ]]; then
+    C_INFO=$'\033[0;34m'
+    C_SUCCESS=$'\033[0;32m'
+    C_WARN=$'\033[0;33m'
+    C_ERROR=$'\033[0;31m'
+    C_RESET=$'\033[0m'
+else
+    C_INFO="" C_SUCCESS="" C_WARN="" C_ERROR="" C_RESET=""
+fi
+
+function info() {
+    echo -e "${C_INFO}[pre-commit]${C_RESET} ${1}"
+}
+
+function success() {
+    echo -e "${C_SUCCESS}[pre-commit]${C_RESET} ${1}"
+}
+
+function warn() {
+    echo -e "${C_WARN}[pre-commit]${C_RESET} ${1}"
+}
+
+function error() {
+    echo -e "${C_ERROR}[pre-commit]${C_RESET} ${1}" >&2
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+# Only run if files matching the trigger pattern are staged
+CHANGED_FILES=$(git diff --cached --name-only --diff-filter=ACM | grep -E "${TRIGGER_PATTERN}" || true)
+
+if [[ -z "${CHANGED_FILES}" ]]; then
+    exit 0
+fi
+
+info "Source files changed, validating architecture diagrams..."
+info "Changed files:"
+echo "${CHANGED_FILES}" | while IFS= read -r f; do
+    echo "  ${f}"
+done
+
+# Check that node is available
+if ! command -v node &>/dev/null; then
+    warn "node not found -- skipping diagram validation"
+    warn "Install node and run: npm install"
+    exit 0
+fi
+
+# Check that the validation script exists
+if [[ ! -f "${VALIDATE_SCRIPT}" ]]; then
+    warn "Validation script not found: ${VALIDATE_SCRIPT}"
+    warn "Set validateScript in diagrams.json or copy validate-architecture.mjs to tools/"
+    exit 0
+fi
+
+# Check that node_modules exist (acorn, acorn-walk)
+if [[ ! -d "${REPO_ROOT}/node_modules/acorn" ]]; then
+    warn "node_modules not installed -- skipping diagram validation"
+    warn "Run: npm install"
+    exit 0
+fi
+
+# Run validation
+echo ""
+node "${VALIDATE_SCRIPT}"
+RESULT=$?
+
+if [[ ${RESULT} -ne 0 ]]; then
+    echo ""
+    error "Commit blocked: architecture diagrams are out of date."
+    echo ""
+    echo "To fix:"
+    echo "  1. Review the changes above"
+    echo "  2. Update the review file to reflect the changes"
+    echo "  3. Stage both and retry your commit"
+    echo ""
+    echo "To bypass: git commit --no-verify"
+    echo ""
+    exit 1
+fi
+
+# Auto-stage updated diagram files
+if [[ -d "${DIAGRAMS_DIR}" ]]; then
+    git add "${DIAGRAMS_DIR}"/*.mmd 2>/dev/null || true
+    git add "${DIAGRAMS_DIR}"/graph-data.json 2>/dev/null || true
+    success "Auto-staged updated diagram files"
+fi
+
+success "Architecture validation passed"
+exit 0
