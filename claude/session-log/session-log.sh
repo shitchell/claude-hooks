@@ -70,12 +70,13 @@ else
     log "claude-stream not found, using raw JSONL"
 fi
 
-# Build the prompt file
-{
-    echo '<transcript>'
-    cat "${WORK_FILE}"
-    echo '</transcript>'
-    echo '
+# Spawn a detached process to summarize and append to the log
+nohup bash -c '
+SUMMARY=$({
+    echo "<transcript>"
+    cat "$1"
+    echo "</transcript>"
+    cat <<RULES
 Rules:
 - One bullet per accomplishment, terse -- action and outcome, not process
 - If the session was trivial (just greetings, testing, etc.), a single bullet is fine
@@ -86,39 +87,33 @@ Rules:
 - Do NOT include any headers, paragraphs, or any other elements -- ONLY a bulleted list
 
 Example of correct output:
-```md
 - Fixed authentication bug in login flow
 - Refactored database connection pooling
 - decision: use Redis for session storage
   - rationale: user said, "we need sub-millisecond lookups"
-```'
-} > "${WORK_FILE}.tmp"
-mv "${WORK_FILE}.tmp" "${WORK_FILE}"
-
-# Spawn a detached process to summarize and append to the log
-nohup bash -c '
-SUMMARY=$(ANTHROPIC_API_KEY="" CLAUDE_SESSION_LOG_ACTIVE=1 claude -p --model haiku --system-prompt "You are a session log writer. The session transcript is provided on stdin. Output ONLY markdown bullet lines starting with \"- \". No headings, no preamble, no labels, no bold text, no explanation -- just the bullets." < "$2")
+RULES
+} | ANTHROPIC_API_KEY="" CLAUDE_SESSION_LOG_ACTIVE=1 claude -p --model haiku --system-prompt "You are a session log writer. The session transcript is provided on stdin. Output ONLY markdown bullet lines starting with \"- \". No headings, no preamble, no labels, no bold text, no explanation -- just the bullets.")
 
 if [[ -n "$SUMMARY" ]]; then
-    LAST_HEADING=$(grep "^## " "$3" 2>/dev/null | tail -1)
+    LAST_HEADING=$(grep "^## " "$2" 2>/dev/null | tail -1)
     {
-        if [[ "$LAST_HEADING" != "## $4" ]]; then
-            [[ -s "$3" ]] && echo ""
-            echo "## $4"
+        if [[ "$LAST_HEADING" != "## $3" ]]; then
+            [[ -s "$2" ]] && echo ""
+            echo "## $3"
         fi
         echo ""
-        echo "### $5 @ $6"
-        echo "<!-- $5:$7 -->"
+        echo "### $4 @ $5"
+        echo "<!-- $4:$6 -->"
         echo ""
         echo "$SUMMARY"
-    } >> "$3"
-    echo "$(date -Iseconds) wrote summary to log" >> "$8"
+    } >> "$2"
+    echo "$(date -Iseconds) wrote summary to log" >> "$7"
 else
-    echo "$(date -Iseconds) no summary generated" >> "$8"
+    echo "$(date -Iseconds) no summary generated" >> "$7"
 fi
 
-rm -f "$2"
-' -- "$PROMPT" "$WORK_FILE" "$LOG_FILE" "$TODAY" "$SESSION_ID" "$TIMESTAMP" "$TOTAL_LINES" "$TRACE_LOG" >>"$TRACE_LOG" 2>&1 &
+rm -f "$1"
+' -- "$WORK_FILE" "$LOG_FILE" "$TODAY" "$SESSION_ID" "$TIMESTAMP" "$TOTAL_LINES" "$TRACE_LOG" >>"$TRACE_LOG" 2>&1 &
 
 log "detached claude process spawned (pid $!)"
 exit 0
