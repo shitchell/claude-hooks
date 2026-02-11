@@ -70,25 +70,34 @@ else
     log "claude-stream not found, using raw JSONL"
 fi
 
-PROMPT="You are a session log writer. The session transcript is provided on stdin. Output ONLY markdown bullet lines starting with \"- \". No headings, no preamble, no labels, no bold text, no explanation -- just the bullets.
-
+# Build the prompt file
+{
+    echo '<transcript>'
+    cat "${WORK_FILE}"
+    echo '</transcript>'
+    echo '
 Rules:
 - One bullet per accomplishment, terse -- action and outcome, not process
 - If the session was trivial (just greetings, testing, etc.), a single bullet is fine
 - If any decisions were made with stated rationale, use this pattern:
   - decision: short description of the decision
-    - rationale: verbatim quote from the user, e.g. user said, \"the exact words they used\"
+    - rationale: verbatim quote from the user, e.g. user said, "the exact words they used"
   Only include rationale that was explicitly stated -- never infer or paraphrase
+- Do NOT include any headers, paragraphs, or any other elements -- ONLY a bulleted list
 
 Example of correct output:
+```md
 - Fixed authentication bug in login flow
 - Refactored database connection pooling
 - decision: use Redis for session storage
-  - rationale: user said, \"we need sub-millisecond lookups\""
+  - rationale: user said, "we need sub-millisecond lookups"
+```'
+} > "${WORK_FILE}.tmp"
+mv "${WORK_FILE}.tmp" "${WORK_FILE}"
 
 # Spawn a detached process to summarize and append to the log
 nohup bash -c '
-SUMMARY=$(ANTHROPIC_API_KEY="" CLAUDE_SESSION_LOG_ACTIVE=1 claude -p --model haiku "$1" < "$2")
+SUMMARY=$(ANTHROPIC_API_KEY="" CLAUDE_SESSION_LOG_ACTIVE=1 claude -p --model haiku --system-prompt "You are a session log writer. The session transcript is provided on stdin. Output ONLY markdown bullet lines starting with "- ". No headings, no preamble, no labels, no bold text, no explanation -- just the bullets." < "$2")
 
 if [[ -n "$SUMMARY" ]]; then
     LAST_HEADING=$(grep "^## " "$3" 2>/dev/null | tail -1)
