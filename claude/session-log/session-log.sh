@@ -97,7 +97,7 @@ mv "${WORK_FILE}.tmp" "${WORK_FILE}"
 
 # Spawn a detached process to summarize and append to the log
 nohup bash -c '
-SUMMARY=$(ANTHROPIC_API_KEY="" CLAUDE_SESSION_LOG_ACTIVE=1 claude -p --model haiku --system-prompt "You are a session log writer. The session transcript is provided on stdin. Output ONLY markdown bullet lines starting with "- ". No headings, no preamble, no labels, no bold text, no explanation -- just the bullets." < "$2")
+SUMMARY=$(ANTHROPIC_API_KEY="" CLAUDE_SESSION_LOG_ACTIVE=1 claude -p --model haiku --system-prompt "You are a session log writer. The session transcript is provided on stdin. Output ONLY markdown bullet lines starting with \"- \". No headings, no preamble, no labels, no bold text, no explanation -- just the bullets." < "$2")
 
 if [[ -n "$SUMMARY" ]]; then
     LAST_HEADING=$(grep "^## " "$3" 2>/dev/null | tail -1)
