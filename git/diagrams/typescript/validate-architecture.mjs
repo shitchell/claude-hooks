@@ -945,8 +945,6 @@ function main() {
     console.log(`  2. Stage it: ${C.DIM}git add ${reviewRelPath}${C.RESET}`);
     console.log(`  3. Retry your commit`);
     console.log('');
-    console.log(`${C.DIM}To bypass: git commit --no-verify${C.RESET}`);
-    console.log('');
 
     process.exit(1);
 }

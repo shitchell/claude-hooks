@@ -11,8 +11,6 @@
 # Strict review mode:
 #   git config docs.strictReview true
 #
-# Bypass:
-#   git commit --no-verify
 
 set -o pipefail
 
@@ -92,9 +90,6 @@ if [[ ${RESULT} -ne 0 ]]; then
     else
         echo ""
         error "Commit blocked: architecture diagrams are out of date."
-        echo ""
-        echo "To bypass: git commit --no-verify"
-        echo "To disable: git config docs.strictReview false"
         echo ""
         exit 1
     fi

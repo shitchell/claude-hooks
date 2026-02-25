@@ -155,16 +155,6 @@ When enabled (`git config docs.strictReview true`), the pre-commit hook:
    - Instructions for what to review
 5. Rejects the commit until the review file is staged
 
-Bypass for a single commit:
-```bash
-git commit --no-verify
-```
-
-Disable permanently:
-```bash
-git config docs.strictReview false
-```
-
 ## Connected-type analysis
 
 The validation script uses the TypeScript compiler API (`ts.createProgram()`)
