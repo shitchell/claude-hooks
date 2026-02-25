@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+#
+# Pre-commit hook: Validate architecture diagrams when TypeScript files change
+#
+# Detects staged .ts/.tsx files and runs the architecture validation script,
+# which regenerates Mermaid diagrams and (in strict review mode) blocks the
+# commit if the review file isn't staged alongside structural changes.
+#
+# Configuration: diagrams.json in repo root (optional)
+#
+# Strict review mode:
+#   git config docs.strictReview true
+#
+# Bypass:
+#   git commit --no-verify
+
+set -o pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+# Defaults
+TRIGGER_PATTERN='\.tsx?$'
+VALIDATE_SCRIPT="${REPO_ROOT}/tools/validate-architecture.mjs"
+DIAGRAMS_DIR="${REPO_ROOT}/docs/diagrams"
+
+# Load config overrides from diagrams.json
+if [[ -f "${REPO_ROOT}/diagrams.json" ]] && command -v node &>/dev/null; then
+    _config=$(node -e "
+        const c = JSON.parse(require('fs').readFileSync('${REPO_ROOT}/diagrams.json', 'utf-8'));
+        if (c.triggerPattern) console.log('TRIGGER_PATTERN=' + c.triggerPattern);
+        if (c.validateScript) console.log('VALIDATE_SCRIPT=${REPO_ROOT}/' + c.validateScript);
+        if (c.diagramsDir) console.log('DIAGRAMS_DIR=${REPO_ROOT}/' + c.diagramsDir);
+    " 2>/dev/null)
+
+    while IFS='=' read -r key val; do
+        [[ -z "${key}" ]] && continue
+        case "${key}" in
+            TRIGGER_PATTERN) TRIGGER_PATTERN="${val}" ;;
+            VALIDATE_SCRIPT) VALIDATE_SCRIPT="${val}" ;;
+            DIAGRAMS_DIR) DIAGRAMS_DIR="${val}" ;;
+        esac
+    done <<< "${_config}"
+fi
+
+# Colors
+if [[ -t 1 ]]; then
+    C_INFO=$'\033[0;34m'  C_SUCCESS=$'\033[0;32m'
+    C_WARN=$'\033[0;33m'  C_ERROR=$'\033[0;31m'  C_RESET=$'\033[0m'
+else
+    C_INFO=""  C_SUCCESS=""  C_WARN=""  C_ERROR=""  C_RESET=""
+fi
+
+info()    { echo -e "${C_INFO}[docs]${C_RESET} ${1}"; }
+success() { echo -e "${C_SUCCESS}[docs]${C_RESET} ${1}"; }
+warn()    { echo -e "${C_WARN}[docs]${C_RESET} ${1}"; }
+error()   { echo -e "${C_ERROR}[docs]${C_RESET} ${1}" >&2; }
+
+# Only run if TS files are staged
+CHANGED_FILES=$(git diff --cached --name-only --diff-filter=ACMR | grep -E "${TRIGGER_PATTERN}" || true)
+if [[ -z "${CHANGED_FILES}" ]]; then
+    exit 0
+fi
+
+# Check strict review mode (matches Go: git config docs.strictReview)
+STRICT_MODE=$(git config --get docs.strictReview 2>/dev/null || echo "false")
+
+info "TypeScript files changed, validating architecture diagrams..."
+
+# Prerequisite checks
+if ! command -v node &>/dev/null; then
+    warn "node not found -- skipping diagram validation"
+    exit 0
+fi
+if [[ ! -f "${VALIDATE_SCRIPT}" ]]; then
+    warn "Validation script not found: ${VALIDATE_SCRIPT}"
+    exit 0
+fi
+if ! node -e "require('typescript')" 2>/dev/null; then
+    warn "typescript not installed -- skipping diagram validation"
+    exit 0
+fi
+
+# Run validation
+echo ""
+node "${VALIDATE_SCRIPT}"
+RESULT=$?
+
+if [[ ${RESULT} -ne 0 ]]; then
+    if [[ "${STRICT_MODE}" != "true" ]]; then
+        warn "Diagrams are out of date (strict review not enabled, allowing commit)"
+        warn "Enable with: git config docs.strictReview true"
+    else
+        echo ""
+        error "Commit blocked: architecture diagrams are out of date."
+        echo ""
+        echo "To bypass: git commit --no-verify"
+        echo "To disable: git config docs.strictReview false"
+        echo ""
+        exit 1
+    fi
+fi
+
+# Auto-stage updated diagram files
+if [[ -d "${DIAGRAMS_DIR}" ]]; then
+    git add "${DIAGRAMS_DIR}"/*.mmd 2>/dev/null || true
+    git add "${DIAGRAMS_DIR}"/graph-data.json 2>/dev/null || true
+    git add "${DIAGRAMS_DIR}"/.tracking 2>/dev/null || true
+    success "Auto-staged updated diagram files"
+fi
+
+success "Architecture validation passed"
+exit 0

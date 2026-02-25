@@ -1,0 +1,14 @@
+{
+    "_comment": "diagrams.json -- Configuration for TypeScript diagram generation hooks",
+    "_comment2": "Place this file as diagrams.json in your repository root.",
+
+    "scanDirs": ["src"],
+    "diagramsDir": "docs/diagrams",
+    "reviewFile": "docs/ARCHITECTURE.md",
+    "validateScript": "tools/validate-architecture.mjs",
+    "triggerPattern": "\\.tsx?$",
+    "entryPatterns": ["index\\.ts$", "main\\.ts$"],
+    "extensions": [".ts", ".tsx"],
+    "tsconfig": "tsconfig.json",
+    "baseDir": ""
+}

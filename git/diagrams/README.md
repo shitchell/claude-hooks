@@ -121,6 +121,37 @@ rich approach to the Go version's gopls analysis.
 - No function-level call graph (module-level dependencies instead)
 - Consumer analysis via import graph rather than language server
 
+### [TypeScript](typescript/) — Production-ready
+
+Uses the TypeScript compiler API for both AST parsing and connected-type
+analysis. Generates deterministic Mermaid diagrams with full strict review mode
+including SHA256 fingerprinting and rich relationship categorization — the
+closest match to the Go variant's gopls-powered analysis, using TypeScript's
+own type system instead of a language server.
+
+| Feature | Status |
+|---------|--------|
+| Class/type diagrams | TS compiler API → Mermaid classDiagram → SVG |
+| Module dependency graph | TS compiler API → Mermaid graph LR → SVG |
+| Smart diffing | SHA256 (output is deterministic) |
+| Strict review mode | Full, with .tracking file (Go-style) |
+| Connected-type analysis | Full: TS compiler API with relationship categorization (creates/param/returns/field/extends/uses) |
+| Configuration | `diagrams.json` |
+
+**Differences from JavaScript:**
+- Uses TypeScript compiler API instead of acorn for parsing
+- Full connected-type analysis via `ts.createProgram()` (not just graph-based consumers)
+- Extracts interfaces, enums, type aliases, and abstract classes (TS-specific constructs)
+- Relationship categorization matches Go's gopls analysis (creates, param, returns, field, extends, uses)
+- `tsconfig.json` integration for path resolution and type checking
+
+**Differences from Go:**
+- Three scripts (generate + validate + pre-commit wrapper)
+- Graph data stored as JSON for structured diff analysis
+- No function-level call graph (module-level dependencies instead)
+- Mermaid output instead of PlantUML/GraphViz
+- No byte-frequency matching needed (output is fully deterministic)
+
 ### [Python](python/) — Experimental
 
 Uses `pyreverse` (from pylint) for class and package diagrams rendered via
