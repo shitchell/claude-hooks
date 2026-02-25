@@ -552,6 +552,19 @@ function generateModuleDependencies(fileMap) {
  * @param {Map<string, object>} fileMap - Map of relPath -> parseFile() results
  * @returns {string} - Mermaid classDiagram text
  */
+/**
+ * Sanitize a type signature for Mermaid classDiagram syntax.
+ * - Replaces <T> with ~T~ (Mermaid generic syntax)
+ * - Replaces inline object types { ... } with Object (Mermaid can't parse braces in members)
+ */
+function sanitizeMermaid(sig) {
+    // First, replace inline object types like { width: number; height: number } with Object
+    let result = sig.replace(/\{[^}]*\}/g, 'Object');
+    // Then replace angle brackets with tildes for generics
+    result = result.replace(/</g, '~').replace(/>/g, '~');
+    return result;
+}
+
 function generateClassHierarchy(fileMap) {
     const lines = ['classDiagram'];
 
@@ -584,12 +597,12 @@ function generateClassHierarchy(fileMap) {
 
         const sortedProps = [...iface.properties].sort();
         for (const prop of sortedProps) {
-            lines.push(`        +${prop}`);
+            lines.push(`        +${sanitizeMermaid(prop)}`);
         }
 
         const sortedMethods = [...iface.methods].sort();
         for (const method of sortedMethods) {
-            lines.push(`        +${method}`);
+            lines.push(`        +${sanitizeMermaid(method)}`);
         }
 
         lines.push('    }');
@@ -605,12 +618,12 @@ function generateClassHierarchy(fileMap) {
 
         const sortedProps = [...cls.properties].sort();
         for (const prop of sortedProps) {
-            lines.push(`        +${prop}`);
+            lines.push(`        +${sanitizeMermaid(prop)}`);
         }
 
         const sortedMethods = [...cls.methods].sort();
         for (const method of sortedMethods) {
-            lines.push(`        +${method}`);
+            lines.push(`        +${sanitizeMermaid(method)}`);
         }
 
         lines.push('    }');
