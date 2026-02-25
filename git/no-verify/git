@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+#
+# Git wrapper that intercepts --no-verify usage.
+#
+# When placed earlier in PATH than the real git, this wrapper checks all
+# arguments for --no-verify (stopping at --) and either blocks, warns, or
+# passes through based on the configured mode.
+#
+# Configuration (checked in order):
+#   1. Environment variable: GIT_NOVERIFY_MODE
+#   2. Git config: noverify.mode
+#
+# Modes:
+#   strict  - Print error and exit non-zero (block the command)
+#   warn    - Print warning but allow the command to proceed
+#   (unset) - Pass through silently (wrapper is effectively a no-op)
+
+# Find the real git binary (skip our own directory)
+__self_dir="$(cd "$(dirname "$0")" && pwd)"
+__real_git=""
+
+IFS=: read -ra __path_dirs <<< "$PATH"
+for __dir in "${__path_dirs[@]}"; do
+    [[ "$__dir" == "$__self_dir" ]] && continue
+    if [[ -x "$__dir/git" ]]; then
+        __real_git="$__dir/git"
+        break
+    fi
+done
+
+if [[ -z "$__real_git" ]]; then
+    echo "error: no-verify wrapper: cannot find real git binary" >&2
+    exit 127
+fi
+
+# Determine mode: env var takes precedence over git config
+__mode="${GIT_NOVERIFY_MODE:-}"
+if [[ -z "$__mode" ]]; then
+    __mode=$("$__real_git" config --get noverify.mode 2>/dev/null || true)
+fi
+
+# No mode configured — pass through silently
+if [[ -z "$__mode" ]]; then
+    exec "$__real_git" "$@"
+fi
+
+# Scan arguments for --no-verify, stopping at --
+for __arg in "$@"; do
+    [[ "$__arg" == "--" ]] && break
+    if [[ "$__arg" == "--no-verify" || "$__arg" == "-n" ]]; then
+        if [[ "$__mode" == "strict" ]]; then
+            echo ""
+            echo " ┌─────────────────────────────────────────────────────────────────┐"
+            echo " │  --no-verify is disabled                                        │"
+            echo " └─────────────────────────────────────────────────────────────────┘"
+            echo ""
+            echo " If you take issue with a git hook, escalate to a human rather"
+            echo " than bypassing it."
+            echo ""
+            exit 1
+        elif [[ "$__mode" == "warn" ]]; then
+            echo ""
+            echo "Warning: you have bypassed commit hooks. You should report this"
+            echo "action for review and discussion why the hook warranted bypassing."
+            echo "Otherwise, you should consider resetting your commit and retrying in"
+            echo "accordance with the established procedures of this repository."
+            echo ""
+        fi
+        break
+    fi
+done
+
+exec "$__real_git" "$@"
